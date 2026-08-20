@@ -177,8 +177,12 @@ generate_thumbnail() {
   # Callers fan out one generator per image, so keep each vips single-threaded.
   # The lock fd is closed for vips so a hung vips cannot hold the lock after
   # this shell is gone.
+  #
+  # -o rather than the newer --path: libvips renamed the option, and only -o is
+  # understood by both. On a version that has only --path the whole call fails,
+  # silently, and the grid quietly falls back to full-size originals forever.
   if VIPS_CONCURRENCY=1 vipsthumbnail "$image" --size "$THUMB_SIZE" --smartcrop=centre \
-      --path "${tmp}[Q=82,strip]" {lock_fd}>&- 2>/dev/null; then
+      -o "${tmp}[Q=82,strip]" {lock_fd}>&- 2>/dev/null; then
     mv -f "$tmp" "$thumb"
     # The lock has done its job, so drop it rather than leave one zero-byte
     # file per image in the cache for good. A waiter that takes the unlinked

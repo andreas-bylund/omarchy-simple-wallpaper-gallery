@@ -24,20 +24,6 @@ jobs:
           found=$(find . -path ./.git -prune -o -type l -print)
           [ -z "$found" ] || { echo "symlinks found:"; echo "$found"; exit 1; }
 
-      - name: Probe vipsthumbnail (temporary diagnostic)
-        run: |
-          vips --version || true
-          echo "--- vipsthumbnail options ---"
-          vipsthumbnail --help 2>&1 | head -30 || true
-          echo "--- the exact call the plugin makes ---"
-          sed -n '/^FIXTURE_PNG=/,/^'"'"'$/p' tests/run-tests.sh | sed '1d;$d' | base64 -d > /tmp/f.png
-          file /tmp/f.png
-          VIPS_CONCURRENCY=1 vipsthumbnail /tmp/f.png --size 640x360 \
-            --smartcrop=centre --path '/tmp/o.jpg[Q=82,strip]'
-          echo "exit=$?"
-          ls -l /tmp/o.jpg || echo "NO OUTPUT PRODUCED"
-        continue-on-error: true
-
       - name: shellcheck
         run: shellcheck -x bin/wallpaper-gallery tests/run-tests.sh
 
