@@ -1,0 +1,527 @@
+#!/bin/bash
+# Filesystem backend for the Wallpaper Gallery Omarchy plugin.
+#
+#   wallpaper-gallery list <folder> <0|1>     images as "thumbnail<TAB>path" rows
+#   wallpaper-gallery thumbs <folder> <0|1>   generate missing thumbnails, then exit
+#   wallpaper-gallery theme-list              current theme's backgrounds, same rows
+#   wallpaper-gallery theme-thumbs            thumbnails for the theme's backgrounds
+#   wallpaper-gallery current                 background in use (and its theme twin)
+#   wallpaper-gallery set <image>             make <image> the background
+#   wallpaper-gallery random <folder> <0|1>   set a random image from the folder
+#   wallpaper-gallery hook on|off|status      keep-wallpaper theme-set hook
+#   wallpaper-gallery prune                   drop stale index rows and thumbnails
+#   wallpaper-gallery uninstall               remove every trace outside the repo
+#
+# Row protocol: one line per image, "<thumbnail><TAB><path>", thumbnail empty
+# while none is cached yet. The path is the LAST field, so a tab inside a
+# filename cannot shift the columns. A newline inside a filename cannot be
+# carried by a line-based protocol at all, so those files are skipped.
+#
+# Thumbnails live in ~/.cache/omarchy-wallpaper-gallery, keyed by path, size
+# and mtime through index.tsv — the same design Omarchy's own image picker
+# uses — so listing a large folder costs one awk pass rather than three
+# processes per image. vipsthumbnail does the scaling; without it the rows
+# carry no thumbnail and Qt scales the originals instead.
+#
+# index.tsv rows are "<size:mtime><TAB><hash><TAB><path>": the path goes last
+# for the same reason the row protocol puts it last, so a tab in a filename
+# cannot shift the columns here either. The index is append-only during a
+# generation pass and pruned at the end of it, so neither it nor the cache
+# grows without bound as wallpapers are edited, renamed or deleted.
+
+set -o pipefail
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-wallpaper-gallery"
+INDEX_FILE="$CACHE_DIR/index.tsv"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-wallpaper-gallery"
+LAST_FILE="$STATE_DIR/last-wallpaper"
+HOOK_DIR="$HOME/.config/omarchy/hooks/theme-set.d"
+HOOK_FILE="$HOOK_DIR/wallpaper-gallery-keep"
+BACKGROUND_LINK="$HOME/.local/state/omarchy/current/background"
+LIVE_THEME_BG="$HOME/.local/state/omarchy/current/theme/backgrounds"
+USER_BG_DIR="$HOME/.config/omarchy/backgrounds"
+KEEP_LINK_NAME=".00-wallpaper-gallery-current"
+# Exported because generate_thumbnail runs in bash -c subshells under xargs.
+export THUMB_SIZE="640x360"
+
+# Where this plugin is installed, so the generated hook can tell whether the
+# plugin is still there and retire itself when it is not.
+PLUGIN_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+IMAGE_GLOBS=(-iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' -o -iname '*.bmp' -o -iname '*.webp')
+
+# Settings arrive from shell.json, where a hand-edited "~/Pictures" is the
+# natural thing to write; Omarchy's own path settings accept it too.
+expand_path() {
+  local path="$1"
+  # The patterns are literal text to recognise, not paths for the shell to
+  # expand — expanding them is precisely this function's job.
+  # shellcheck disable=SC2088,SC2016
+  case "$path" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${path#\~/}" ;;
+    '$HOME') printf '%s' "$HOME" ;;
+    '$HOME/'*) printf '%s/%s' "$HOME" "${path#\$HOME/}" ;;
+    *) printf '%s' "$path" ;;
+  esac
+}
+
+# Emits NUL-delimited "<size>:<mtime><TAB><path>" records.
+#
+# -xdev and the depth cap keep a symlink to $HOME — or to a network mount —
+# from turning "include subfolders" into a scan of the whole machine. Hidden
+# directories are pruned rather than filtered, so .git and node_modules cost
+# nothing to skip. -mindepth 1 exempts the chosen folder itself, which may
+# perfectly well be a dotted path such as ~/.local/share/wallpapers.
+# find exits non-zero for an unreadable subdirectory it skipped; that is not
+# a reason to discard the images it did find, so its status is dropped.
+scan_folder() {
+  local folder="$1" recursive="$2" depth=1
+  [[ $recursive == 1 ]] && depth=4
+  find -L "$folder" -xdev -mindepth 1 -maxdepth "$depth" \
+    \( -name '.*' -prune \) -o \
+    -type f \( "${IMAGE_GLOBS[@]}" \) -printf '%s:%T@\t%p\0' 2>/dev/null
+  return 0
+}
+
+# The stable source directory of the current theme's backgrounds. The live
+# copy under current/theme is replaced wholesale on every theme switch, so a
+# path recorded from there stops existing the moment you switch away (and its
+# mtimes reset, churning the thumbnail cache). Falls back to the live copy on
+# Omarchy versions without omarchy-theme-dir.
+theme_bg_source() {
+  local theme_name theme_src
+  theme_name=$(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null)
+  [[ -n $theme_name ]] || return 1
+  theme_src=$(omarchy-theme-dir "$theme_name" 2>/dev/null)
+  if [[ -n $theme_src && -d $theme_src/backgrounds ]]; then
+    realpath "$theme_src/backgrounds" 2>/dev/null
+  else
+    printf '%s' "$LIVE_THEME_BG"
+  fi
+}
+
+# Same records as scan_folder, for the theme's own backgrounds plus the
+# user's additions for it. Hidden files are skipped so our own keep-link —
+# which lives in the user background folder precisely so theme-set finds it —
+# is not listed back as if it were one of the theme's wallpapers.
+scan_theme() {
+  local theme_name src_bg dir
+  theme_name=$(cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null)
+  [[ -n $theme_name ]] || return 0
+  src_bg=$(theme_bg_source) || return 0
+  for dir in "$src_bg" "$USER_BG_DIR/$theme_name"; do
+    [[ -d $dir ]] || continue
+    find -L "$dir" -mindepth 1 -maxdepth 1 ! -name '.*' \
+      -type f \( "${IMAGE_GLOBS[@]}" \) -printf '%s:%T@\t%p\0' 2>/dev/null
+  done
+  return 0
+}
+
+# stdin: scan records, joined against the thumbnail index.
+#
+#   index_join rows     "<thumbnail><TAB><path>" lines, thumbnail empty when
+#                       the image has no cached thumbnail yet
+#   index_join missing  NUL-delimited "<hash><TAB><sig><TAB><path>", hash empty
+#                       when the index has not seen this image before
+#
+# Both readers share one awk program so the index format — and the ordering
+# trap around RS — lives in a single place. One awk pass either way, and no
+# per-image processes.
+index_join() {
+  awk -v mode="$1" -v cache="$CACHE_DIR" -v idxfile="$INDEX_FILE" '
+    BEGIN {
+      FS = "\t"
+      # The index is newline-separated, so it must be read before RS is
+      # switched to NUL for the scan records on stdin. Its path field is last,
+      # so it is cut out by offset rather than by splitting: a tab inside a
+      # filename must not shift the columns here either.
+      while ((getline line < idxfile) > 0) {
+        c = index(line, "\t")
+        if (c == 0) continue
+        isig = substr(line, 1, c - 1); rest = substr(line, c + 1)
+        c = index(rest, "\t")
+        if (c == 0) continue
+        hash[substr(rest, c + 1) "\t" isig] = substr(rest, 1, c - 1)
+      }
+      RS = "\0"
+    }
+    {
+      cut = index($0, "\t")
+      if (cut == 0) next
+      sig = substr($0, 1, cut - 1); path = substr($0, cut + 1)
+      # A newline cannot be carried by the line-based row protocol at all.
+      if (path ~ /\n/) next
+      key = path "\t" sig
+      if (mode == "rows")
+        print (key in hash ? cache "/" hash[key] ".jpg" : "") "\t" path
+      else
+        printf "%s\t%s\t%s%c", (key in hash ? hash[key] : ""), sig, path, 0
+    }
+  '
+}
+
+# stdin: scan records. stdout: rows sorted by path.
+emit_rows() {
+  index_join rows | sort -t "$(printf '\t')" -k2
+}
+
+generate_thumbnail() {
+  local image="$1" thumb="$2" lock="$2.lock" tmp="$2.$$.jpg" lock_fd
+  # A generator killed between writing and renaming leaves its partial file
+  # behind. Only the lock holder writes those, so any present now are stale.
+  exec {lock_fd}>"$lock" || return 0
+  flock -w 30 "$lock_fd" || return 0
+  rm -f "$thumb".*.jpg
+  [[ -f $thumb ]] && return 0
+  # Callers fan out one generator per image, so keep each vips single-threaded.
+  # The lock fd is closed for vips so a hung vips cannot hold the lock after
+  # this shell is gone.
+  if VIPS_CONCURRENCY=1 vipsthumbnail "$image" --size "$THUMB_SIZE" --smartcrop=centre \
+      --path "${tmp}[Q=82,strip]" {lock_fd}>&- 2>/dev/null; then
+    mv -f "$tmp" "$thumb"
+    # The lock has done its job, so drop it rather than leave one zero-byte
+    # file per image in the cache for good. A waiter that takes the unlinked
+    # inode next simply finds the finished thumbnail and returns.
+    rm -f "$lock"
+  else
+    rm -f "$tmp"
+  fi
+}
+export -f generate_thumbnail
+
+# stdin: scan records. Generates every missing thumbnail. Images already in
+# the index cost no processes at all; only genuinely new files are hashed.
+gen_missing() {
+  command -v vipsthumbnail >/dev/null 2>&1 || { cat >/dev/null; return 0; }
+  mkdir -p "$CACHE_DIR"
+  : >>"$INDEX_FILE"
+
+  local record sig path hash thumb
+  # The single-quoted "$1"/"$2" belong to bash -c, not to this shell.
+  # shellcheck disable=SC2016
+  index_join missing | {
+    while IFS= read -r -d '' record; do
+      hash=${record%%$'\t'*}; record=${record#*$'\t'}
+      sig=${record%%$'\t'*}; path=${record#*$'\t'}
+      if [[ -z $hash ]]; then
+        hash=$(printf '%s\t%s' "$path" "$sig" | md5sum | cut -d ' ' -f 1)
+        printf '%s\t%s\t%s\n' "$sig" "$hash" "$path" >>"$INDEX_FILE"
+      fi
+      thumb="$CACHE_DIR/$hash.jpg"
+      [[ -f $thumb ]] && continue
+      printf '%s\0%s\0' "$path" "$thumb"
+    done
+  } | xargs -0 -r -n 2 -P "$(nproc)" bash -c 'generate_thumbnail "$1" "$2"' _
+  return 0
+}
+
+# The panel starts the folder pass and the theme pass at the same moment, and
+# both append to the index and then prune it. One lock around a whole pass
+# keeps a prune from dropping rows the other pass has just appended.
+cache_lock() {
+  mkdir -p "$CACHE_DIR" || return 1
+  exec {cache_lock_fd}>"$CACHE_DIR/.cache.lock" || return 1
+  flock -w 60 "$cache_lock_fd" || return 1
+  return 0
+}
+
+# The index is append-only within a pass, so every edited, renamed or deleted
+# image leaves a row — and the thumbnail that row points at — behind for good.
+# Pruning keeps the newest row for each path that still exists, then drops
+# every cached file no surviving row names: superseded thumbnails, leftover
+# locks and any temporary a killed generator left behind. One stat per indexed
+# image plus one readdir, cheap enough to run after every generation pass.
+prune_cache() {
+  [[ -f $INDEX_FILE ]] || return 0
+  local tmp file base sig hash path
+  local -A newest=() keep=()
+  tmp=$(mktemp "$INDEX_FILE.XXXXXX") || return 0
+  # Reading forward and letting later rows win leaves one row per path: the
+  # newest signature seen for it. IFS is a tab alone and path reads last, so a
+  # filename containing tabs or spaces survives the round trip intact.
+  while IFS=$'\t' read -r sig hash path; do
+    [[ -n $hash && -n $path ]] || continue
+    newest[$path]="$sig"$'\t'"$hash"
+  done <"$INDEX_FILE"
+  for path in "${!newest[@]}"; do
+    [[ -f $path ]] || continue
+    sig=${newest[$path]%%$'\t'*}
+    hash=${newest[$path]#*$'\t'}
+    keep[$hash]=1
+    printf '%s\t%s\t%s\n' "$sig" "$hash" "$path"
+  done >"$tmp"
+  mv -f "$tmp" "$INDEX_FILE"
+
+  # Only "<hash>.jpg" for a surviving row stays. The glob covers thumbnails,
+  # their locks and interrupted temporaries while leaving index.tsv and the
+  # cache lock alone.
+  for file in "$CACHE_DIR"/*.jpg*; do
+    [[ -f $file ]] || continue
+    base=${file##*/}
+    [[ $base == *.jpg && -n ${keep[${base%.jpg}]:-} ]] || rm -f -- "$file"
+  done
+  return 0
+}
+
+theme_slugs() {
+  local dir
+  for dir in "${OMARCHY_PATH:-/usr/share/omarchy}"/themes/*/ "$HOME/.config/omarchy/themes"/*/; do
+    [[ -d $dir ]] && basename "$dir"
+  done | sort -u
+}
+
+# With keep-mode on, every theme's user-background folder carries a leading
+# symlink to the kept wallpaper. When the background in use is not among the
+# new theme's backgrounds, omarchy-theme-set falls back to the first one it
+# finds — and user backgrounds sort before the theme's own — so the switch
+# "transitions" from the kept wallpaper to itself: no flash of the theme's
+# background at all. The theme-set hook remains as the fallback for themes
+# installed after the links were seeded.
+sync_keep_links() {
+  local target ext slug dir made_root
+  target=""
+  [[ -f $LAST_FILE ]] && target=$(<"$LAST_FILE")
+  # A kept wallpaper that has been deleted or renamed must not leave the old
+  # links standing, or every theme switch would resurrect a stale pick.
+  if [[ -z $target || ! -f $target ]]; then
+    remove_keep_links
+    return 0
+  fi
+  ext=${target##*.}
+  ext=${ext,,}
+  case "$ext" in jpg|jpeg|png|gif|bmp|webp) ;; *) return 0 ;; esac
+  while IFS= read -r slug; do
+    [[ -n $slug ]] || continue
+    dir="$USER_BG_DIR/$slug"
+    # Remember the folders we created, so turning the toggle off never
+    # removes one the user made themselves — including the backgrounds root,
+    # which mkdir -p may have to create on the way to the first theme folder.
+    if [[ ! -d $dir ]]; then
+      made_root=0
+      [[ -d $USER_BG_DIR ]] || made_root=1
+      mkdir -p "$dir" || continue
+      mkdir -p "$STATE_DIR"
+      (( made_root )) && : >"$STATE_DIR/created-bg-root"
+      printf '%s\n' "$slug" >>"$STATE_DIR/created-dirs"
+    fi
+    rm -f "$dir/$KEEP_LINK_NAME".*
+    ln -sf "$target" "$dir/$KEEP_LINK_NAME.$ext"
+  done < <(theme_slugs)
+}
+
+remove_keep_links() {
+  local dir slug
+  [[ -n $KEEP_LINK_NAME ]] || return 0
+  for dir in "$USER_BG_DIR"/*/; do
+    [[ -d $dir ]] || continue
+    rm -f "$dir/$KEEP_LINK_NAME".*
+  done
+  # Only folders this plugin created are cleaned up; anything the user made
+  # stays, empty or not.
+  if [[ -f $STATE_DIR/created-dirs ]]; then
+    while IFS= read -r slug; do
+      [[ -n $slug ]] || continue
+      rmdir --ignore-fail-on-non-empty "$USER_BG_DIR/$slug" 2>/dev/null
+    done <"$STATE_DIR/created-dirs"
+    rm -f "$STATE_DIR/created-dirs"
+  fi
+  # The backgrounds root goes the same way: only if we were the ones to make it.
+  if [[ -f $STATE_DIR/created-bg-root ]]; then
+    rmdir --ignore-fail-on-non-empty "$USER_BG_DIR" 2>/dev/null
+    rm -f "$STATE_DIR/created-bg-root"
+  fi
+  return 0
+}
+
+record_choice() {
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$1" >"$LAST_FILE"
+  [[ -f $HOOK_FILE ]] && sync_keep_links
+  return 0
+}
+
+cmd_list() {
+  local folder
+  folder=$(realpath -e "$(expand_path "$1")" 2>/dev/null) || exit 1
+  scan_folder "$folder" "$2" | emit_rows
+}
+
+cmd_thumbs() {
+  local folder
+  folder=$(realpath -e "$(expand_path "$1")" 2>/dev/null) || exit 1
+  cache_lock || exit 0
+  scan_folder "$folder" "$2" | gen_missing
+  prune_cache
+  exit 0
+}
+
+cmd_theme_list() {
+  scan_theme | emit_rows
+}
+
+cmd_theme_thumbs() {
+  cache_lock || exit 0
+  scan_theme | gen_missing
+  prune_cache
+  exit 0
+}
+
+cmd_prune() {
+  [[ -d $CACHE_DIR ]] || return 0
+  cache_lock || return 0
+  prune_cache
+}
+
+# The background in use, plus — when it resolves inside the theme's live copy
+# — the same file in the theme's stable source directory. The widget marks
+# whichever of the two a listed wallpaper matches, so the badge lands however
+# the background happened to be set.
+cmd_current() {
+  local current source_dir
+  current=$(readlink -f "$BACKGROUND_LINK" 2>/dev/null) || return 0
+  [[ -n $current ]] || return 0
+  printf '%s\n' "$current"
+  if [[ $current == "$LIVE_THEME_BG"/* ]]; then
+    source_dir=$(theme_bg_source) || return 0
+    [[ -n $source_dir && $source_dir != "$LIVE_THEME_BG" && -f $source_dir/${current##*/} ]] &&
+      printf '%s\n' "$source_dir/${current##*/}"
+  fi
+  return 0
+}
+
+cmd_set() {
+  local image
+  image=$(expand_path "${1:-}")
+  # Recorded only once the file is known to exist and the background actually
+  # changed: a stale last-wallpaper would keep every theme switch pinned to a
+  # wallpaper that is gone, or to one that was never put up in the first place.
+  [[ -n $image && -f $image ]] || exit 1
+  omarchy-theme-bg-set "$image" || exit 1
+  record_choice "$image"
+}
+
+cmd_random() {
+  local folder pick
+  folder=$(realpath -e "$(expand_path "$1")" 2>/dev/null) || exit 1
+  pick=$(scan_folder "$folder" "$2" | shuf -z -n 1 | cut -d "$(printf '\t')" -f 2-)
+  [[ -n $pick && -f $pick ]] || exit 1
+  omarchy-theme-bg-set "$pick" || exit 1
+  record_choice "$pick"
+}
+
+# The keep-wallpaper machinery is two parts. The keep-links above make the
+# theme switch land directly on the kept wallpaper, flash-free. This hook —
+# a self-contained script in Omarchy's theme-set hook directory — is the
+# fallback for a theme whose folder had no link yet (installed after the
+# links were seeded): it restores the wallpaper and seeds the link so the
+# next switch is flash-free too. It also retires itself once the plugin is
+# gone, so removing the plugin cannot leave theme switching hijacked.
+write_hook() {
+  mkdir -p "$HOOK_DIR"
+  cat >"$HOOK_FILE" <<EOF
+#!/bin/bash
+# Installed by the Wallpaper Gallery Omarchy plugin ("Keep wallpaper across
+# theme switches"). Turning that toggle off removes this file, and so does
+# removing the plugin.
+#
+# The paths below are written through printf %q, so a home directory holding a
+# quote or a dollar sign cannot break — or inject into — this script.
+plugin_dir=$(printf '%q' "$PLUGIN_DIR")
+keep_link=$(printf '%q' "$KEEP_LINK_NAME")
+user_bg=$(printf '%q' "$USER_BG_DIR")
+EOF
+  cat >>"$HOOK_FILE" <<'EOF'
+theme="$1"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-wallpaper-gallery"
+last="$state_dir/last-wallpaper"
+
+# The plugin was removed without turning the toggle off. Clean up after
+# ourselves rather than silently overriding theme switches forever.
+if [[ ! -d $plugin_dir ]]; then
+  for dir in "$user_bg"/*/; do
+    [[ -d $dir ]] && rm -f "$dir/$keep_link".*
+  done
+  # Only the folders this plugin created are removed; the user's own stay.
+  if [[ -f $state_dir/created-dirs ]]; then
+    while IFS= read -r slug; do
+      [[ -n $slug ]] && rmdir --ignore-fail-on-non-empty "$user_bg/$slug" 2>/dev/null
+    done <"$state_dir/created-dirs"
+  fi
+  [[ -f $state_dir/created-bg-root ]] &&
+    rmdir --ignore-fail-on-non-empty "$user_bg" 2>/dev/null
+  rm -rf "$state_dir" "${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-wallpaper-gallery"
+  rm -f "$0"
+  exit 0
+fi
+
+[[ -f $last ]] || exit 0
+wallpaper=$(<"$last")
+[[ -f $wallpaper ]] || exit 0
+
+# Seed this theme's keep-link so the next switch to it goes straight to the
+# kept wallpaper instead of flashing the theme's own background first.
+ext="${wallpaper##*.}"
+ext="${ext,,}"
+if [[ -n $theme && $ext =~ ^(jpg|jpeg|png|gif|bmp|webp)$ ]]; then
+  mkdir -p "$user_bg/$theme"
+  rm -f "$user_bg/$theme/$keep_link".*
+  ln -sf "$wallpaper" "$user_bg/$theme/$keep_link.$ext"
+fi
+
+# When the keep-link did its job the switch already landed on the kept
+# wallpaper, and re-setting it would only cause the flash this avoids.
+current=$(readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null)
+[[ $current == "$(readlink -f "$wallpaper" 2>/dev/null)" ]] && exit 0
+
+omarchy-theme-bg-set "$wallpaper"
+EOF
+  chmod +x "$HOOK_FILE"
+}
+
+cmd_hook() {
+  case "${1:-}" in
+    on)
+      write_hook
+      sync_keep_links
+      ;;
+    off)
+      rm -f "$HOOK_FILE"
+      remove_keep_links
+      ;;
+    status)
+      [[ -f $HOOK_FILE ]] && echo on || echo off
+      ;;
+    *)
+      echo "Usage: wallpaper-gallery hook on|off|status" >&2
+      exit 64
+      ;;
+  esac
+}
+
+# Everything this plugin writes outside its own directory, in one command,
+# so removing it is a two-liner rather than a scavenger hunt.
+cmd_uninstall() {
+  rm -f "$HOOK_FILE"
+  remove_keep_links
+  rm -rf "$CACHE_DIR" "$STATE_DIR"
+  echo "Removed the theme-set hook, keep-links, thumbnail cache and saved state."
+  echo "The plugin itself: omarchy plugin remove bylund.wallpaper-gallery"
+}
+
+case "${1:-}" in
+  list)         cmd_list "${2:-}" "${3:-0}" ;;
+  thumbs)       cmd_thumbs "${2:-}" "${3:-0}" ;;
+  theme-list)   cmd_theme_list ;;
+  theme-thumbs) cmd_theme_thumbs ;;
+  current)      cmd_current ;;
+  set)          cmd_set "${2:-}" ;;
+  random)       cmd_random "${2:-}" "${3:-0}" ;;
+  hook)         cmd_hook "${2:-}" ;;
+  prune)        cmd_prune ;;
+  uninstall)    cmd_uninstall ;;
+  *)
+    echo "Usage: wallpaper-gallery list|thumbs|theme-list|theme-thumbs|current|set|random|hook|prune|uninstall ..." >&2
+    exit 64
+    ;;
+esac

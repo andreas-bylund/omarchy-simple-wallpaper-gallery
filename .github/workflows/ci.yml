@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck and vipsthumbnail
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck libvips-tools
+
+      - name: Manifest is valid JSON
+        run: jq -e . manifest.json > /dev/null
+
+      - name: Plugin folder has no symlinks
+        # The Omarchy loader and the marketplace both refuse them.
+        run: |
+          found=$(find . -path ./.git -prune -o -type l -print)
+          [ -z "$found" ] || { echo "symlinks found:"; echo "$found"; exit 1; }
+
+      - name: shellcheck
+        run: shellcheck -x bin/wallpaper-gallery tests/run-tests.sh
+
+      - name: Tests
+        run: tests/run-tests.sh

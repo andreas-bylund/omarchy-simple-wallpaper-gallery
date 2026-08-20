@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "id": "bylund.wallpaper-gallery",
+  "name": "Wallpaper Gallery",
+  "version": "0.1.0",
+  "author": "Andreas Bylund",
+  "description": "Browse a folder of wallpapers as a thumbnail grid and click one to make it your background.",
+  "homepage": "https://github.com/andreas-bylund/omarchy-simple-wallpaper-gallery",
+  "license": "MIT",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Wallpaper Gallery",
+    "description": "Thumbnail grid over a wallpaper folder of your choice. Click an image to set it as the background, middle-click the bar icon for a random one.",
+    "category": "Appearance",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "folder": "",
+      "includeSubfolders": false,
+      "keepAcrossThemes": false,
+      "columns": 3
+    },
+    "schema": [
+      {
+        "key": "folder",
+        "type": "path",
+        "label": "Wallpaper folder",
+        "defaultValue": "",
+        "description": "Absolute path to the folder holding your wallpapers. Also typeable from the gear inside the panel; ~ and $HOME are expanded."
+      },
+      {
+        "key": "includeSubfolders",
+        "type": "boolean",
+        "label": "Include subfolders",
+        "defaultValue": false,
+        "description": "Also show images inside folders within the wallpaper folder. Also toggleable from the gear inside the panel."
+      },
+      {
+        "key": "keepAcrossThemes",
+        "type": "boolean",
+        "label": "Keep wallpaper across theme switches",
+        "defaultValue": false,
+        "description": "Installs a theme-set hook that re-applies your last pick from the gallery after a theme change. Also toggleable from the gear inside the panel."
+      },
+      {
+        "key": "columns",
+        "type": "integer",
+        "label": "Grid columns",
+        "min": 2,
+        "max": 5,
+        "step": 1,
+        "defaultValue": 3
+      }
+    ]
+  }
+}
