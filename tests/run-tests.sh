@@ -60,9 +60,19 @@ make_sandbox() {
   mkdir -p "$HOME" "$WALLPAPERS"
 }
 
-# A minimal valid PNG, so vipsthumbnail has something real to chew on.
+# A real 160x90 PNG, not a single pixel. The plugin asks vipsthumbnail for a
+# smartcrop, and libvips refuses that on a 1x1 image on some versions, so a
+# degenerate fixture would test the library's edge cases rather than the
+# plugin's thumbnail path.
+FIXTURE_PNG='
+iVBORw0KGgoAAAANSUhEUgAAAKAAAABaCAIAAACwpMoFAAAAv0lEQVR42u3RMRGAQBAEwVOAGOSQ
+fEKAExxgg+RF4AA5oOO2umoUTFd9peQsACzAAizAAizAAgxYgAVYgAVYgAUYsACrYeu7KTjAgAVY
+gAVYgAVYgAELsAALsAALsAADFmB1BN7vqeAAAxZgARZgARZgAQYswAIswAIswAIMWIDVEfg6FwUH
+GLAAC7AAC7AACzBgARZgARZgARZgwAKsjsDPOBQcYMACLMACLMACLMCABViABViABViAAQuwGvYD
+VKl+RFbiDvAAAAAASUVORK5CYII=
+'
 make_png() {
-  printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' >"$1"
+  printf '%s' "$FIXTURE_PNG" | base64 -d >"$1"
 }
 
 # The wallpaper the keep-mode tests hang their links on.
@@ -227,7 +237,9 @@ if command -v vipsthumbnail >/dev/null 2>&1; then
     "$([[ -n $thumb && -f $thumb ]] && echo 1 || echo 0)"
   check_eq "the index has one row per thumbnailed image" "1" \
     "$(grep -c 'thumbme.png' "$CACHE/index.tsv" 2>/dev/null)"
-  check_eq "generation leaves no lock files behind" "0" \
+  # Both generate_thumbnail (on success) and prune drop these; what matters
+  # is that they never pile up one per image.
+  check_eq "no lock files accumulate in the cache" "0" \
     "$(count_cache "$CACHE" '*.jpg.lock')"
 
   # The row protocol puts the path last so a tab cannot shift the columns;
