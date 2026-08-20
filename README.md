@@ -1,4 +1,4 @@
-# Wallpaper Gallery for Omarchy
+# Simple Wallpaper Gallery for Omarchy
 
 A bar widget for [Omarchy](https://omarchy.org) that shows the wallpapers in a
 folder of your choice as a thumbnail grid. Click a thumbnail and it becomes
